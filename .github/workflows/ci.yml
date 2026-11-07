@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:                 # every push, on any branch
+  pull_request:
+    branches: [main]    # every pull request into main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: pytest -v
+
+  # "CD" part: after a merge into main, carve the sample image with every
+  # finished finder and publish the results as a downloadable artifact.
+  demo:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Carve samples
+        run: |
+          mkdir -p out
+          # Add dp / greedy here once they are implemented.
+          for algo in dummy; do
+            python cli.py images/sample.png --width 180 --height 130 --algo $algo --output out/sample_$algo.png
+          done
+          # Graph cut is slow, so it only gets the small image.
+          # python cli.py images/small.png --width 40 --algo graphcut --output out/small_graphcut.png
+      - uses: actions/upload-artifact@v4
+        with:
+          name: carved-samples
+          path: out/
