@@ -33,7 +33,7 @@ Use `images/small.png` (50 x 40) for graph cut.
 | `seam_carving/dp.py` | P2 | DP seam finder |
 | `seam_carving/greedy.py` | P4 | greedy seam finder |
 | `seam_carving/graphcut.py` | P5 | graph cut seam finder |
-| `seam_carving/visualize.py` | P6 | seam overlay, step frames, GIF (to add) |
+| `seam_carving/visualize.py` | P6 | seam overlay, all-seams image, step-by-step GIF |
 | `app.py` | P6 | interactive app (to add) |
 | `benchmarks/run_bench.py` | P3 | timing and comparison (to add) |
 | `cli.py` | P1 | command-line entry point |
@@ -63,6 +63,30 @@ callback(step, direction, current_img, seam_mask, orig_rows, orig_cols)
 # seam_mask:   bool array, same height/width as current_img, True on the seam
 # orig_rows, orig_cols: where the removed pixels were in the ORIGINAL image
 ```
+
+## Visualisation (P6)
+
+`seam_carving/visualize.py` records every seam while `carve()` runs and draws it.
+
+```python
+from seam_carving.core import carve, load_image, save_image
+from seam_carving.finders import get_finder
+from seam_carving.visualize import SeamRecorder, all_seams_on_original, make_gif
+
+img = load_image("images/sample.png")
+recorder = SeamRecorder()                      # pass as the on_seam callback
+result = carve(img, 180, 130, get_finder("dp"), on_seam=recorder)
+
+# Every removed seam on the original image (red = vertical, blue = horizontal)
+save_image(all_seams_on_original(img, recorder.removed), "out/all_seams.png")
+
+# Step-by-step animation: every 2nd seam, 2x enlarged, ending on the result
+make_gif(recorder.frames, "out/steps.gif", every=2, scale=2, final_frame=result)
+```
+
+- `recorder.removed`: list of `(direction, orig_rows, orig_cols)`, one per seam, in original-image coordinates.
+- `recorder.frames`: one image per seam with that seam drawn on it. Use `SeamRecorder(keep_frames=False)` for big images if you only need the all-seams picture.
+- `tests/test_visualize.py` checks that deleting the recorded pixels from the original gives exactly the carved result.
 
 ## Workflow
 
