@@ -57,3 +57,52 @@ def all_seams_on_original(orig_img, removed):
         colour = VERTICAL_COLOUR if direction == "vertical" else HORIZONTAL_COLOUR
         out[rows, cols] = colour  # fancy indexing: paint pixel (rows[k], cols[k]) for every k
     return out
+
+
+def pad_to(img, height, width, fill=255):
+    """Place img in the top-left corner of a height x width canvas.
+
+    The image gets smaller after every seam, but every frame of a GIF
+    must be the same size, so we pad each frame back up to the original
+    size (white by default).
+    """
+    canvas = np.full((height, width, 3), fill, dtype=np.uint8)
+    h, w = img.shape[:2]
+    canvas[:h, :w] = img
+    return canvas
+
+
+def make_gif(frames, path, every=1, scale=1, duration_ms=60,
+             final_frame=None, hold_ms=1500):
+    """Save the step-by-step frames as an animated GIF.
+
+    frames:      SeamRecorder.frames (one image per seam, seam drawn on it)
+    every:       keep only every Nth frame, to keep the file small
+    scale:       enlarge small images by this factor (nearest-neighbour,
+                 so seams stay sharp 1-pixel lines instead of blurring)
+    duration_ms: how long each step is shown
+    final_frame: optional carved result, shown at the end for hold_ms
+    """
+    from PIL import Image  # Pillow, installed with imageio
+
+    if not frames:
+        raise ValueError("no frames to save: did carve() remove any seams?")
+
+    chosen = list(frames[::every])
+    durations = [duration_ms] * len(chosen)
+    if final_frame is not None:
+        chosen.append(final_frame)
+        durations.append(hold_ms)
+
+    # The first frame is the biggest (nothing removed yet), so use its size.
+    height, width = frames[0].shape[:2]
+
+    pil_frames = []
+    for frame in chosen:
+        padded = pad_to(frame, height, width)
+        if scale != 1:
+            padded = np.repeat(np.repeat(padded, scale, axis=0), scale, axis=1)
+        pil_frames.append(Image.fromarray(padded))
+
+    pil_frames[0].save(path, save_all=True, append_images=pil_frames[1:],
+                       duration=durations, loop=0)  # loop=0: repeat forever
