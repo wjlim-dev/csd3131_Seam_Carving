@@ -1,0 +1,59 @@
+"""Seam visualisation (bonus Item 7a).
+
+Uses the on_seam hook in core.carve() to draw seams as they are removed.
+"""
+
+import numpy as np
+
+SEAM_COLOUR = (255, 0, 0)  # red, images in this project are RGB
+
+
+def overlay_seam(img, mask, colour=SEAM_COLOUR):
+    """Return a copy of img with the seam pixels painted in colour.
+
+    img:  H x W x 3 uint8 RGB image (the image BEFORE the seam is removed)
+    mask: H x W bool array, True on the seam pixels
+    """
+    out = img.copy()      # copy so we never change the image carve() is using
+    out[mask] = colour    # boolean indexing: paint every pixel where mask is True
+    return out
+
+
+VERTICAL_COLOUR = (255, 0, 0)      # red: seams that shrink the width
+HORIZONTAL_COLOUR = (0, 120, 255)  # blue: seams that shrink the height
+
+
+class SeamRecorder:
+    """Pass an instance as carve(..., on_seam=recorder).
+
+    carve() calls it once per seam. It remembers where every removed
+    seam was in the ORIGINAL image, and (optionally) keeps a frame of
+    each step with the seam drawn on it, for the step-by-step GIF.
+    """
+
+    def __init__(self, keep_frames=True):
+        self.keep_frames = keep_frames
+        self.removed = []  # list of (direction, orig_rows, orig_cols)
+        self.frames = []   # one RGB image per seam, seam drawn in colour
+
+    def __call__(self, step, direction, current_img, seam_mask, orig_rows, orig_cols):
+        # orig_rows/orig_cols are already in original-image coordinates
+        # (core.carve tracks this with its index maps), so we just store them.
+        self.removed.append((direction, orig_rows.copy(), orig_cols.copy()))
+
+        if self.keep_frames:
+            colour = VERTICAL_COLOUR if direction == "vertical" else HORIZONTAL_COLOUR
+            self.frames.append(overlay_seam(current_img, seam_mask, colour))
+
+
+def all_seams_on_original(orig_img, removed):
+    """Return a copy of the original image with every removed seam drawn on it.
+
+    orig_img: the image BEFORE any carving
+    removed:  SeamRecorder.removed, a list of (direction, orig_rows, orig_cols)
+    """
+    out = orig_img.copy()
+    for direction, rows, cols in removed:
+        colour = VERTICAL_COLOUR if direction == "vertical" else HORIZONTAL_COLOUR
+        out[rows, cols] = colour  # fancy indexing: paint pixel (rows[k], cols[k]) for every k
+    return out
