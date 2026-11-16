@@ -33,7 +33,7 @@ Use `images/small.png` (50 x 40) for graph cut.
 | `seam_carving/finders.py` | P1 | algorithm name to finder lookup |
 | `seam_carving/dp.py` | P2 | DP seam finder |
 | `seam_carving/greedy.py` | P4 | greedy seam finder |
-| `seam_carving/graphcut.py` | P5 | graph cut seam finder |
+| `seam_carving/graphcut.py` | P5 | graph cut seam finder (min-cut / max-flow, small images only) |
 | `seam_carving/visualize.py` | P6 | seam overlay, all-seams image, step-by-step GIF |
 | `app.py` | P6 | interactive Streamlit app (resize, step-by-step view, compare) |
 | `benchmarks/run_bench.py` | P3 | timing and comparison (to add) |
@@ -63,6 +63,28 @@ callback(step, direction, current_img, seam_mask, orig_rows, orig_cols)
 # current_img: image before this seam is removed (normal orientation)
 # seam_mask:   bool array, same height/width as current_img, True on the seam
 # orig_rows, orig_cols: where the removed pixels were in the ORIGINAL image
+```
+
+## Graph cut (P5)
+
+`seam_carving/graphcut.py` finds the seam as a minimum s–t cut:
+
+1. One node per pixel, plus source `s` and sink `t`.
+   `s` → every column-0 pixel (∞), each pixel → its right neighbour with capacity = its energy,
+   last-column pixels → `t` with capacity = their energy.
+2. ∞ backward edges `(i, j+1) → (i, j)` force exactly one cut per row; ∞ diagonal edges
+   `(i, j) → (i±1, j-1)` keep the seam connected.
+3. Edmonds–Karp max-flow, then a BFS from `s` in the residual graph finds the source side of the cut.
+4. Seam pixel in each row = the rightmost pixel still reachable from `s`.
+
+The seam has the same total energy as DP's (max-flow min-cut theorem); `tests/test_graphcut.py`
+checks this on random arrays. Unlike the brief, the last column drains to `t` with capacity = energy
+rather than ∞, so the last column can be removed and 1-column images don't give infinite flow.
+
+Edmonds–Karp is O(V·E²) per seam, so use `images/small.png`:
+
+```bash
+python cli.py images/small.png --width 40 --height 30 --algo graphcut --output out/graphcut.png
 ```
 
 ## Visualisation (P6)
