@@ -59,18 +59,23 @@ plus the checks behind the timing method:
 
 5. Multithreading (brief Item 5d)
    OpenCV on 1 thread vs its default number of threads, for the energy map
-   and for whole carves. OpenCV is the only part here that can use several
+   and for whole carves. OpenCV is the only part here that uses several
    threads: NumPy's element-wise maths runs on one thread, and DP's rows
-   must be computed in order because each row needs the one above.
+   must be computed in order because each row needs the one above (the
+   cells within a row are independent, but NumPy already does a whole row
+   in compiled code, and one row is too little work to share).
    -> threading.csv, threading.png
 
 6. Divide and conquer for the Sobel filter (brief Item 2b)
-   The energy map's Sobel filter computed four ways on the same images:
-   OpenCV (what energy.py uses), one NumPy pass, divide and conquer over
-   tiles, and FFT convolution. Each is checked against OpenCV's map. Then
-   divide and conquer alone with different tile sizes at the largest width:
-   the work is the same, so any change in time comes from the memory cache
-   or from the cost of each tile.
+   The energy map's Sobel filter computed five ways on the same images:
+   OpenCV (what energy.py uses), one NumPy pass that makes new arrays for
+   each step, the same pass writing into arrays it reuses, divide and
+   conquer over tiles, and FFT convolution. Each is checked against
+   OpenCV's map. The two one-pass versions do the same arithmetic, so the
+   gap between them is the cost of making fresh arrays. Then divide and
+   conquer alone with different tile sizes at the largest width: the work
+   is the same, so any change in time comes from memory or from the cost
+   of each tile.
    -> sobel_methods.csv, sobel_methods.png, sobel_tiles.csv
 
 7. Method checks (summary.md section 7)
@@ -876,6 +881,50 @@ def sobel_direct(gray):
     return _sobel_inside(np.pad(gray, 1, mode="reflect"))
 
 
+_SOBEL_BUFFERS = {}  # (height, width) -> arrays that sobel_reused makes once and reuses
+
+
+def sobel_reused(gray):
+    """The same one pass as sobel_direct, step for step, but every step writes
+    into arrays made once per image size and reused on later calls (NumPy's
+    out=), so a call makes no new arrays. The arithmetic and its order are
+    the same, so the result equals sobel_direct's exactly, and any gap in
+    time between the two is the cost of making fresh arrays.
+
+    Returns one of its reused arrays: copy it to keep it past the next call.
+    Images under 2 x 2 have no reflected border, so they go to sobel_direct.
+    """
+    height, width = gray.shape
+    if height < 2 or width < 2:
+        return sobel_direct(gray)
+    buffers = _SOBEL_BUFFERS.get((height, width))
+    if buffers is None:
+        buffers = _SOBEL_BUFFERS[(height, width)] = (
+            np.empty((height + 2, width + 2)),) + tuple(np.empty((height, width)) for _ in range(4))
+    p, gx, gy, part, twice = buffers
+    # The border np.pad(mode="reflect") would add: row 1 above row 0, and so on.
+    p[1:-1, 1:-1] = gray
+    p[0, 1:-1], p[-1, 1:-1] = gray[1], gray[-2]
+    p[:, 0], p[:, -1] = p[:, 2], p[:, -3]
+
+    def weighted_sum(first, middle, last, out):
+        """out = first + 2 * middle + last, in the same order as _sobel_inside."""
+        np.multiply(middle, 2, out=twice)
+        np.add(first, twice, out=out)
+        out += last
+
+    weighted_sum(p[:-2, 2:], p[1:-1, 2:], p[2:, 2:], gx)
+    weighted_sum(p[:-2, :-2], p[1:-1, :-2], p[2:, :-2], part)
+    gx -= part
+    weighted_sum(p[2:, :-2], p[2:, 1:-1], p[2:, 2:], gy)
+    weighted_sum(p[:-2, :-2], p[:-2, 1:-1], p[:-2, 2:], part)
+    gy -= part
+    np.abs(gx, out=gx)
+    np.abs(gy, out=gy)
+    gx += gy
+    return gx
+
+
 def sobel_divide_conquer(gray, leaf=SOBEL_LEAF):
     """Divide and conquer: split the image in half along its longer side until
     each tile is at most leaf x leaf, filter each tile with a one-pixel border
@@ -918,14 +967,15 @@ def sobel_fft(gray):
     return out
 
 
-SOBEL_METHODS = {"opencv": sobel_opencv, "direct": sobel_direct,
+SOBEL_METHODS = {"opencv": sobel_opencv, "direct": sobel_direct, "reused": sobel_reused,
                  "divide": sobel_divide_conquer, "fft": sobel_fft}
-SOBEL_LABELS = {"opencv": "OpenCV (cv2.Sobel)", "direct": "direct, one pass",
-                "divide": "divide and conquer", "fft": "FFT convolution"}
+SOBEL_LABELS = {"opencv": "OpenCV (cv2.Sobel)", "direct": "one pass, new arrays",
+                "reused": "one pass, reused arrays", "divide": "divide and conquer",
+                "fft": "FFT convolution"}
 
 
 def sobel_methods(img, widths, repeats):
-    """Time the four ways of computing the energy map's Sobel filter on the same
+    """Time the five ways of computing the energy map's Sobel filter on the same
     greyscale images, and check each gives OpenCV's map. Rows: width, height,
     pixels, <method>_ms (+ range), <method>_diff (largest difference)."""
     grays = {width: gray_of(resize_to_width(img, width)) for width in widths}
@@ -949,8 +999,9 @@ SOBEL_TILES = (16, 32, 64, 128, 256)  # tile sizes for the tile-size check, plus
 def sobel_tile_sizes(img, width, repeats):
     """Divide and conquer at one image size with different largest tiles, up
     to one tile for the whole image. Every tile size does the same work, so
-    a time that changes with tile size points to the memory cache, not to
-    less work. Rows: leaf, tiles, label, divide_ms (+ range)."""
+    a time that changes with tile size points to memory (the size of the
+    arrays each tile makes) or to the cost of each tile, not to less work.
+    Rows: leaf, tiles, label, divide_ms (+ range)."""
     gray = gray_of(resize_to_width(img, width))
     whole = max(gray.shape)
     leaves = [leaf for leaf in SOBEL_TILES if leaf < whole] + [whole]
@@ -987,6 +1038,37 @@ def _tile_effect(tile_rows):
 
 
 # ---------- method checks: why the timing is done this way (section 7) ----------
+
+def prefer_fast_cores():
+    """Ask Windows not to run this process in its power-saving mode (EcoQoS).
+
+    On a CPU with fast and efficient cores, Windows can move a background
+    process onto the slower efficient cores while it runs, so one pass of a
+    timing can come out much slower than another for no reason in the code.
+    Turning off execution-speed throttling for the process (the same switch
+    as "powercfg /powerthrottling disable") asks the scheduler to treat it as
+    full-speed work. Returns True if Windows accepted, False elsewhere.
+    """
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    class PowerThrottlingState(ctypes.Structure):
+        _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG),
+                    ("StateMask", wintypes.ULONG)]
+
+    # Version 1; control execution speed (0x1); state 0 = never throttle it.
+    state = PowerThrottlingState(1, 0x1, 0)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                               wintypes.DWORD]
+    kernel32.SetProcessInformation.restype = wintypes.BOOL
+    process_power_throttling = 4  # PROCESS_INFORMATION_CLASS value
+    return bool(kernel32.SetProcessInformation(kernel32.GetCurrentProcess(), process_power_throttling,
+                                               ctypes.byref(state), ctypes.sizeof(state)))
+
 
 def method_checks(img, finders, repeats):
     """Measure, in this run, the reasons behind the timing method.
@@ -1293,7 +1375,8 @@ def plot_map_dependence(rows, names, path):
 
 
 SOBEL_STYLES = {"opencv": ("-", "o", INK), "direct": ("--", "s", INK_2),
-                "divide": ("-.", "D", INK_2), "fft": (":", "^", MUTED)}
+                "reused": ("-", "v", MUTED), "divide": ("-.", "D", INK_2),
+                "fft": (":", "^", MUTED)}
 
 
 def plot_sobel_methods(rows, path):
@@ -1319,7 +1402,7 @@ def plot_sobel_methods(rows, path):
     _label_line_ends(ax, ends)
     ax.set_xlabel("Pixels (H x W, log scale)", color=INK_2)
     ax.set_ylabel("Time for one energy map (ms, log scale)", color=INK_2)
-    ax.set_title("Item 2b: the Sobel filter computed four ways", loc="left", color=INK, fontsize=11)
+    ax.set_title("Item 2b: the Sobel filter computed five ways", loc="left", color=INK, fontsize=11)
     ax.legend(frameon=False, labelcolor=INK_2, fontsize=9, ncol=2,
               loc="upper left", bbox_to_anchor=(0, -0.16))
     fig.savefig(path, facecolor=SURFACE, bbox_inches="tight")
@@ -1745,8 +1828,8 @@ def conclusions(setup, timing, shapes, quality, carve_rows, threads, base_rows, 
                 text += f" So the results are the same pictures ({_and_list(files)}, section 4)."
             elif crop_like:
                 text += (f" So on {_and_list(crop_like)} {n} behaves far more like a plain crop "
-                         "than DP does, cutting off a strip instead of choosing seams around the "
-                         f"content: compare the seams in {_and_list(files)} (section 4).")
+                         "than DP does, cutting off a strip where DP spreads its seams through "
+                         f"low-energy areas: compare the seams in {_and_list(files)} (section 4).")
             else:
                 text += (" Whether the difference is visible depends on the image: compare the "
                          f"seams in {_and_list(files)} (section 4).")
@@ -1770,11 +1853,15 @@ def conclusions(setup, timing, shapes, quality, carve_rows, threads, base_rows, 
     h_slope, _, h_rough = _slope_value(tall, "height", f"{REFERENCE}_ms")
     w_slope, _, w_rough = _slope_value(wide, "width", f"{REFERENCE}_ms")
     if h_slope is not None and w_slope is not None:
+        how = ("far more than" if h_slope >= w_slope + 0.4 else
+               "more than" if h_slope >= w_slope + 0.1 else "about as much as")
         lines.append(f"- **Time complexity (Item 5b):** per seam, DP's time grows with the height "
-                     f"(slope {h_slope:.2f}{', rough' if h_rough else ''}) far more than with "
+                     f"(slope {h_slope:.2f}{', rough' if h_rough else ''}) {how} with "
                      f"the width (slope {w_slope:.2f}{', rough' if w_rough else ''}). "
-                     "Its work is O(H x W), but at these sizes the fixed cost of the NumPy calls "
-                     "it makes for every row dominates (section 2)."
+                     + ("Its work is O(H x W), but at these sizes the fixed cost of the NumPy calls "
+                        "it makes for every row dominates (section 2)." if how != "about as much as"
+                        else "Its work is O(H x W), and at these sizes both sides count about equally "
+                        "(section 2).")
                      + (" Greedy is O(H + W) per seam." if "greedy" in names else "")
                      + " Carving k seams costs k x (O(H x W) + the finder's own cost), because "
                      "every seam needs a new energy map and a seam removal; for DP"
@@ -1888,15 +1975,18 @@ def conclusions(setup, timing, shapes, quality, carve_rows, threads, base_rows, 
         gain = "no worthwhile gain" if high < 1.2 else f"up to {high:.2f}x faster"
         text = (f"- **Does multithreading help? (Item 5d):** {gain}. OpenCV on "
                 f"{setup['cv_threads']} threads instead of 1 changed full-carve times by "
-                f"{low:.2f}x to {high:.2f}x. Only the energy map can use threads; DP's rows "
-                "must run in order.")
+                f"{low:.2f}x to {high:.2f}x. Only the energy map uses threads here: DP's rows "
+                "must run in order, and the cells within one row are already done together in "
+                "NumPy's compiled code, too little work to share between threads.")
         for n in names:
             if any(r["part"] == f"full carve, {n}" for r in threads):
                 continue
             text += (f" {_start(n)} was not timed here, because it cannot carve the full image within "
                      "its pixel limit"
                      + ("; its max-flow runs as plain Python loops, which OpenCV's threads cannot "
-                        "speed up, and each augmenting path depends on the ones before it"
+                        "speed up, and Edmonds-Karp finds one augmenting path at a time, each "
+                        "depending on the flow the earlier ones left; parallel max-flow methods "
+                        "such as push-relabel exist, but it does not use one"
                         if n == "graphcut" else "") + ".")
         lines.append(text[:-1] + " (section 5).")
 
@@ -1941,15 +2031,22 @@ def conclusions(setup, timing, shapes, quality, carve_rows, threads, base_rows, 
             slower = [r for r in sobel_rows if r["divide_ms"] > r["direct_ms"]]
             worst = max(slower, key=lambda r: r["divide_ms"] / r["direct_ms"], default=None)
             effect = _tile_effect(tile_rows)
+            memory = _memory_effect(sobel_rows)
             detail = (f"Divide and conquer ran {1 / ratio:.1f}x faster than the same filter in one "
-                      f"pass at {t['width']} x {t['height']}"
+                      f"pass with new arrays at {t['width']} x {t['height']}"
                       + (f" but was slower at smaller sizes (up to "
                          f"{worst['divide_ms'] / worst['direct_ms']:.1f}x at {worst['width']} x "
                          f"{worst['height']})" if worst else ""))
-            if effect and effect[2] >= 1.5:
+            if memory and memory[0] >= 1.5 * memory[1]:
+                detail += (f". The same one pass writing into reused arrays took "
+                           f"{t['reused_ms']:.2f} ms, {t['direct_ms'] / t['reused_ms']:.1f}x faster "
+                           "than with new arrays, so the gain comes from making smaller fresh arrays "
+                           "(one tile's at a time), not from less work: it does the same O(H x W) work")
+            elif effect and effect[2] >= 1.5:
                 detail += (f". With one whole-image tile the same code took {effect[2]:.1f}x as "
-                           f"long as with tiles of {effect[0]['label']}, so the gain comes from the "
-                           "CPU's cache, not from less work: it does the same O(H x W) work")
+                           f"long as with tiles of {effect[0]['label']}, so the gain most likely "
+                           "comes from the CPU's cache, not from less work: it does the same "
+                           "O(H x W) work")
             else:
                 detail += "; it does the same O(H x W) work, and the cause of the gain is unclear"
         else:
@@ -1959,12 +2056,12 @@ def conclusions(setup, timing, shapes, quality, carve_rows, threads, base_rows, 
         fastest = min(SOBEL_METHODS, key=lambda m: t[f"{m}_ms"])
         diff = max(t[f"{m}_diff"] for m in SOBEL_METHODS)
         lines.append(f"- **Would divide and conquer speed up the Sobel filter? (Item 2b):** {verdict}. "
-                     f"At {t['width']} x {t['height']}: OpenCV {t['opencv_ms']:.2f} ms, one NumPy "
-                     f"pass {t['direct_ms']:.2f} ms, divide and conquer {t['divide_ms']:.2f} ms, FFT "
-                     f"convolution {t['fft_ms']:.2f} ms, and all four give the same map (largest "
-                     f"difference {diff:.0e}). {detail}. Every output pixel needs its own 3 x 3 "
-                     "neighbourhood, so any method must read all H x W pixels, and FFT convolution "
-                     f"is O(H x W log(H x W)). The fastest here was {SOBEL_LABELS[fastest]} "
+                     f"At {t['width']} x {t['height']}: "
+                     + ", ".join(f"{SOBEL_LABELS[m]} {t[m + '_ms']:.2f} ms" for m in SOBEL_METHODS)
+                     + f"; every method gives the same map (largest difference {diff:.0e}). "
+                     f"{detail}. Every output pixel needs its own 3 x 3 neighbourhood, so any method "
+                     "must read all H x W pixels, and FFT convolution, itself a divide-and-conquer "
+                     f"algorithm, is O(H x W log(H x W)). The fastest here was {SOBEL_LABELS[fastest]} "
                      "(section 6).")
 
     unsteady = (len(_unsteady(timing, str, ["energy"] + names))
@@ -2010,14 +2107,69 @@ def _times_short(ratio):
     return f"{ratio:.0f}x" if ratio >= 10 else f"{ratio:.1f}x"
 
 
-def _tile_sentence(tile_rows):
-    """What the tile-size check shows, worded from its numbers ('' if it shows nothing)."""
+def _memory_effect(rows):
+    """How much each one-pass Sobel slowed down per pixel, from its own fastest
+    size to the largest: (with new arrays, with reused arrays). None with
+    fewer than two sizes."""
+    if len(rows) < 2:
+        return None
+
+    def growth(method):
+        per_pixel = [r[f"{method}_ms"] / r["pixels"] for r in rows]
+        return per_pixel[-1] / min(per_pixel)
+    return growth("direct"), growth("reused")
+
+
+def _memory_sentence(rows):
+    """Why the one-pass filter slows down per pixel at large sizes, worded from
+    its two versions ('' with fewer than two sizes)."""
+    effect = _memory_effect(rows)
+    if not effect:
+        return ""
+    fresh, reused = effect
+    t = rows[-1]
+    size = f"{t['width']} x {t['height']}"
+    text = (f"New arrays or reused ones. The same one pass writing into arrays it reuses took "
+            f"{t['reused_ms']:.2f} ms at {size}, against {t['direct_ms']:.2f} ms when it makes new "
+            f"arrays for each step. Per pixel, from its own fastest size to {size}, the version "
+            f"with new arrays slowed {fresh:.1f}x and the version with reused arrays {reused:.1f}x.")
+    if fresh >= 1.5 * reused:
+        text += (" The arithmetic is the same, so most of the slowdown at large sizes is the cost "
+                 "of making fresh arrays"
+                 + (f"; the reused version's own {reused:.1f}x is most likely the CPU's cache, as "
+                    "the arrays outgrow it" if reused >= 1.2 else "")
+                 + ". Large arrays most likely get new memory from the operating system each time, "
+                 "which is set up page by page when first used; that step was not timed on its own.")
+    else:
+        text += (" Both slowed by a similar amount, so the cost is in reaching the memory itself "
+                 "(most likely the CPU's cache), not in making fresh arrays.")
+    return text
+
+
+def _energy_memory_note(sobel_rows):
+    """Section 1's reason why the energy map's time per pixel grows, backed by
+    section 6's one-pass filter with new and with reused arrays."""
+    effect = _memory_effect(sobel_rows)
+    if effect and effect[0] >= 1.5 * effect[1]:
+        return (" Section 6 shows what that costs: the same Sobel arithmetic slowed "
+                f"{effect[0]:.1f}x per pixel across these sizes when it made new arrays, but only "
+                f"{effect[1]:.1f}x when it reused them. That most likely explains the energy map's "
+                "slope above 1 here; it was not measured on the energy map itself.")
+    return (" As the image grows those arrays outgrow a CPU core's own fast cache (L2, about 1 to "
+            "4 MB on current CPUs), and each pixel waits longer for memory. That most likely "
+            "explains a slope above 1 across these sizes; it was not measured directly.")
+
+
+def _tile_sentence(tile_rows, rows=()):
+    """What the tile-size check shows, worded from its numbers ('' if it shows
+    nothing). rows: the Sobel methods' rows, for the memory comparison."""
     effect = _tile_effect(tile_rows)
     if not effect:
         return ""
     best, whole, ratio = effect
     smallest = tile_rows[0]
-    kb = lambda leaf: (leaf + 2) ** 2 * 8 / 1024  # one float64 array for a tile with its border
+    pixels = whole["width"] * whole["height"]
+    kb = lambda tiles: pixels / tiles * 8 / 1024  # one float64 array for the average tile
     text = (f"The same divide-and-conquer code was fastest with tiles of {best['label']} "
             f"({best['divide_ms']:.2f} ms).")
     if smallest is not best and smallest["divide_ms"] > 1.5 * best["divide_ms"]:
@@ -2025,16 +2177,21 @@ def _tile_sentence(tile_rows):
                  f"NumPy calls: {smallest['tiles']} tiles of {smallest['label']} took "
                  f"{smallest['divide_ms']:.2f} ms.")
     if ratio >= 1.5:
-        whole_kb = (whole["width"] + 2) * (whole["height"] + 2) * 8 / 1024
         text += (f" Bigger tiles were slower too, up to {whole['divide_ms']:.2f} ms for one "
-                 f"whole-image tile ({ratio:.1f}x the best), although the work is the same: a tile "
-                 f"of {best['leaf']} x {best['leaf']} uses arrays of about {kb(best['leaf']):.0f} KB "
-                 f"each, the whole image about {whole_kb:.0f} KB, and the filter makes several such "
-                 "temporary arrays, so big tiles outgrow the CPU's fast cache (L2, about 1 to 4 MB) "
-                 "and wait for main memory.")
+                 f"whole-image tile ({ratio:.1f}x the best), although the work is the same: every "
+                 f"step of the filter makes a new array, about {kb(best['tiles']):.0f} KB for each "
+                 f"of the {best['tiles']} tiles of {best['label']} and about {kb(1):.0f} KB for the "
+                 "whole image.")
+        memory = _memory_effect(rows)
+        if memory and memory[0] >= 1.5 * memory[1]:
+            text += (" The reused-array pass above shows that large new arrays are what is slow, "
+                     "so one whole-image tile pays that cost and small tiles avoid it.")
+        else:
+            text += (" Big arrays also outgrow the CPU's fast cache (L2, about 1 to 4 MB), which "
+                     "most likely explains it.")
     else:
         text += (f" One whole-image tile took {whole['divide_ms']:.2f} ms, close to the best, "
-                 "so the cache makes little difference at this size.")
+                 "so memory makes little difference at this size.")
     return text
 
 
@@ -2044,13 +2201,15 @@ def _sobel_section(rows, tile_rows=()):
         return []
     methods = list(SOBEL_METHODS)
     out = ["## 6. Item 2b: would divide and conquer speed up the Sobel filter?", "",
-           "The energy map's Sobel filter (|gx| + |gy| on the greyscale image) computed four ways "
+           "The energy map's Sobel filter (|gx| + |gy| on the greyscale image) computed five ways "
            "on the same images: OpenCV's cv2.Sobel, which energy.py uses; the same 3 x 3 filter "
-           "in one NumPy pass over the whole image; divide and conquer, which splits the image in "
+           "in one NumPy pass over the whole image, making new arrays for each step; the same "
+           "pass writing into arrays made once and reused, which does the same arithmetic "
+           "without making new arrays; divide and conquer, which splits the image in "
            f"half along its longer side until each tile is at most {SOBEL_LEAF} x {SOBEL_LEAF}, "
            "filters each tile with a one-pixel border taken from its neighbours and writes it "
            "into place; and convolution by FFT. Largest difference = the biggest gap from "
-           "OpenCV's map anywhere in the image, over the other three methods.", ""]
+           "OpenCV's map anywhere in the image, over the other four methods.", ""]
     table = [[f"{r['width']} x {r['height']}", r["pixels"]] + [_range(r, m) for m in methods]
              + [f"{max(r[f'{m}_diff'] for m in methods):.0e}"] for r in rows]
     out.append(markdown_table(["Size", "Pixels"] + [f"{SOBEL_LABELS[m]} (ms)" for m in methods]
@@ -2060,9 +2219,10 @@ def _sobel_section(rows, tile_rows=()):
             + _slopes(rows, "pixels", [(SOBEL_LABELS[m], f"{m}_ms") for m in methods]) + "."]
     t = rows[-1]
     ratio = t["divide_ms"] / t["direct_ms"]
-    out += ["", f"At {t['width']} x {t['height']}, against the same filter in one pass: divide and "
-            f"conquer {ratio:.2f}x the time, FFT convolution {t['fft_ms'] / t['direct_ms']:.2f}x, "
-            f"OpenCV {t['opencv_ms'] / t['direct_ms']:.2f}x."]
+    out += ["", f"At {t['width']} x {t['height']}, against the one pass with new arrays: divide and "
+            f"conquer {ratio:.2f}x the time, the same pass with reused arrays "
+            f"{t['reused_ms'] / t['direct_ms']:.2f}x, FFT convolution "
+            f"{t['fft_ms'] / t['direct_ms']:.2f}x, OpenCV {t['opencv_ms'] / t['direct_ms']:.2f}x."]
     reads = (SOBEL_LEAF + 2) ** 2 / SOBEL_LEAF ** 2 - 1
     why = ("Why. Each output pixel depends only on its own 3 x 3 neighbourhood, so every method "
            "has to read all H x W pixels: O(H x W) is a floor no method can go below, and the "
@@ -2071,29 +2231,40 @@ def _sobel_section(rows, tile_rows=()):
            "filtering at the leaves, O(n) in total, so it is O(H x W) as well and cannot cut the "
            f"work; it also re-reads the tile borders (a {SOBEL_LEAF} x {SOBEL_LEAF} tile reads "
            f"{100 * reads:.0f}% more pixels than it writes).")
-    slower = [f"{r['width']} x {r['height']}" for r in rows if r["divide_ms"] > r["direct_ms"]]
+    slower_rows = [r for r in rows if r["divide_ms"] > r["direct_ms"]]
+    slower = [f"{r['width']} x {r['height']}" for r in slower_rows]
     effect = _tile_effect(tile_rows)
+    memory = _memory_effect(rows)
     if ratio < 0.9:
         why += f" It still ran faster at {t['width']} x {t['height']}"
         if slower:
             why += f", though slower at {_and_list(slower)}"
-        if effect and effect[2] >= 1.5:
-            why += (". The tile-size check below shows why: a constant-factor gain from the "
-                    "CPU's cache, not less work.")
-            if slower:
-                why += (" At the smaller sizes the whole image's arrays fit in the cache anyway, "
-                        "so the tiles only add their own cost.")
+        if memory and memory[0] >= 1.5 * memory[1]:
+            why += (". The one pass with reused arrays shows why: large new arrays are slow to "
+                    "make, and divide and conquer only ever makes small ones, one tile's at a "
+                    "time. That is a constant-factor gain from memory handling, not less work.")
+            if slower and all(r["direct_ms"] <= 1.5 * r["reused_ms"] for r in slower_rows):
+                why += (" At the smaller sizes the one pass with new arrays was within 1.5x of the "
+                        "reused-array pass, so making arrays cost little there and the tiles only "
+                        "added their own cost.")
+        elif effect and effect[2] >= 1.5:
+            why += (". The tile-size check below shows a constant-factor gain that most likely "
+                    "comes from the CPU's cache, not less work.")
         else:
-            why += (". The tile-size check does not show a clear cache effect, so the cause is "
-                    "unclear; the work is the same.")
+            why += (". Neither the reused-array pass nor the tile-size check shows a clear "
+                    "memory effect, so the cause is unclear; the work is the same.")
     else:
         why += " So it can only add the cost of the recursion, as measured."
-    why += (" FFT convolution costs O(H x W log(H x W)) and pays off only for large kernels, "
+    why += (" FFT convolution is itself divide and conquer: the FFT splits the transform into "
+            "its even and odd halves, T(n) = 2T(n/2) + O(n) = O(n log n), so it costs "
+            "O(H x W log(H x W)), more than one pass. It pays off only for large kernels, "
             "where it replaces k x k operations per pixel; with k = 3 there is nothing to save. "
             "What divide and conquer does offer is independent tiles that could be filtered on "
             "different threads at once, but OpenCV can already run its filters on several "
             "threads; section 5 measures what that gains on the energy map.")
-    out += ["", why, "", "![Sobel filter, four ways](sobel_methods.png)", ""]
+    memory_text = _memory_sentence(rows)
+    out += ["", why, ""] + ([memory_text, ""] if memory_text else []) + [
+        "![Sobel filter, five ways](sobel_methods.png)", ""]
     if tile_rows:
         first = tile_rows[0]
         out += ["### Tile size", "",
@@ -2103,7 +2274,7 @@ def _sobel_section(rows, tile_rows=()):
                 markdown_table(["Largest tile", "Tiles", "Time (ms)"],
                                [[r["label"], r["tiles"], _range(r, "divide")] for r in tile_rows])]
         out += _steadiness(_unsteady(tile_rows, lambda r: r["label"], ["divide"]))
-        out += ["", _tile_sentence(tile_rows), ""]
+        out += ["", _tile_sentence(tile_rows, rows), ""]
     return out
 
 
@@ -2138,8 +2309,11 @@ def _method_section(setup, checks, timing, shapes, base_rows):
                      + (f" One-call samples also time the timer's own overhead, which made them "
                         f"read {overhead:.1f}x the batched time." if overhead > 1.1 else "")
                      + f" time.perf_counter's resolution here is {checks['resolution_us']:.3f} µs."])
-    rows.append(["The median of the samples", "The mean",
-                 "One sample slowed by another program moves a mean but not a median."])
+    rows.append(["The median of the samples", "The mean, or the minimum (which timeit's documentation "
+                 "suggests [4])",
+                 "One sample slowed by another program moves a mean but not a median. The minimum "
+                 "is the luckiest sample, a lower bound; the median is what a call typically costs, "
+                 "and the lowest and highest passes are reported next to it."])
     spread = pass_spread(timing, ["energy"] + names, lambda r: f"{r['width']} x {r['height']}")
     if spread:
         rows.append([f"{PASSES} passes that take turns over every input; median pass reported "
@@ -2161,13 +2335,24 @@ def _method_section(setup, checks, timing, shapes, base_rows):
          "A slow patch on the machine (another program, the CPU changing speed) then hits every "
          "finder alike, instead of only the one running at that moment."],
         ["One process, with a warm-up", "pyperf's separate worker processes [5]",
-         "Keeps a full run to minutes. The cold start that fresh processes guard against is "
-         "removed by the warm-up; pyperf's calibration, doubling the calls per sample until a "
-         "sample is long enough, was adopted."],
+         "pyperf spreads its samples over many fresh processes, each warmed up first, so that one "
+         "process's random memory layout (ASLR) and hash seed cannot bias the result. One process "
+         "keeps a full run to minutes; the cost is that this run's absolute times may sit a little "
+         "above or below another process's, which is why the conclusions rest on ratios measured "
+         "side by side in the same process. pyperf's calibration, doubling the calls per sample "
+         "until a sample is long enough, was adopted."],
         ["timeit samples", "A profiler (cProfile)",
          "A profiler adds its own overhead to every function call it records, so the times it "
          "reports are not the code's normal times; timeit measures the code as it normally runs."],
     ]
+    if setup.get("fast_cores") is not None:
+        rows.append(["Ask Windows not to throttle the benchmark's process", "Letting Windows decide",
+                     "On a CPU with fast and efficient cores, Windows can move a background process "
+                     "onto the slower efficient cores while it runs, so one pass can come out much "
+                     "slower than another for no reason in the code. "
+                     + ("Windows accepted the request for this run."
+                        if setup["fast_cores"] else
+                        "The request is only available on Windows, so here the system chose the cores.")])
     crops = []
     for picture in ("image", "photo"):
         found = {b["method"]: b for b in base_rows if b.get("picture", "image") == picture}
@@ -2233,7 +2418,8 @@ def build_summary(setup, timing, shapes, quality, carve_rows, threads, base_rows
         + (f" (skipped, not implemented yet: {', '.join(setup['skipped'])})" if setup["skipped"] else ""),
         f"- Machine: {platform.platform()}, {platform.processor() or 'unknown CPU'}, "
         f"{os.cpu_count()} logical CPUs; Python {platform.python_version()}, "
-        f"NumPy {np.__version__}, OpenCV {cv2.__version__} ({setup['cv_threads']} threads by default)",
+        f"NumPy {np.__version__}, OpenCV {cv2.__version__} ({setup['cv_threads']} threads by default)"
+        + ("; Windows power throttling turned off for this process" if setup.get("fast_cores") else ""),
         f"- Image widths: {', '.join(map(str, setup['sizes']))}"
         + (f"; small set for limited finders: {', '.join(map(str, setup['small_sizes']))}"
            if setup["small_sizes"] else ""),
@@ -2288,11 +2474,10 @@ def build_summary(setup, timing, shapes, quality, carve_rows, threads, base_rows
                "its slope here holds for this image's maps: see \"Same sizes, different energy "
                "maps\" in section 2." if map_rows and "graphcut" in names else ""),
             "", "The energy map does the same work for every pixel, so it is O(H x W), yet its time "
-            "per pixel is not constant here (see the ns per pixel column). It needs about "
-            f"{energy_bytes:.0f} bytes of working memory per pixel (memory table below), so as the "
-            "image grows its arrays outgrow a CPU core's own fast cache (L2, about 1 to 4 MB on "
-            "current CPUs) and each pixel waits longer for memory. That most likely explains a "
-            "slope above 1 across these sizes; it was not measured directly.",
+            "per pixel is not constant here (see the ns per pixel column). It makes several new "
+            f"arrays the size of the image on every call, about {energy_bytes:.0f} bytes of working "
+            "memory per pixel (memory table below)."
+            + _energy_memory_note(sobel_rows),
             "", "![Finder timing](finder_timing.png)"]
 
     out += ["", "### Peak extra memory for one seam", "",
@@ -2348,7 +2533,10 @@ def build_summary(setup, timing, shapes, quality, carve_rows, threads, base_rows
         out += [f"![Height vs width{label}]({picture})", ""]
     out += ["A slope of 1 means time is proportional to that side. A slope below 1 means "
             "part of the time does not depend on that side: for DP, the fixed cost of the "
-            "NumPy calls it makes for every row."
+            "NumPy calls it makes for every row"
+            + ("; for greedy, its scan along the whole top row when only the height grows, and "
+               "its walk down every row when only the width grows" if "greedy" in names else "")
+            + "."
             + (" A slope above 1 means the time grows faster than that side, as for graph cut: "
                "every extra row or column adds nodes and edges that each search for an augmenting "
                "path may walk through, and a bigger graph usually needs more of those searches "
@@ -2670,6 +2858,9 @@ def main(argv=None):
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
 
+    # Keep Windows from moving the process to slower cores mid-run (see prefer_fast_cores).
+    fast_cores = prefer_fast_cores()
+
     # First, while the process is still cold: the checks behind the timing method.
     print("1/7 Checking the timing method...")
     checks = method_checks(img, finders, args.repeats)
@@ -2744,7 +2935,7 @@ def main(argv=None):
     write_csv(threads, out / "threading.csv")
     plot_threading(threads, cv_threads, out / "threading.png")
 
-    print("7/7 Item 2b: the Sobel filter four ways...")
+    print("7/7 Item 2b: the Sobel filter five ways...")
     sobel_rows = sobel_methods(img, args.sizes, args.repeats)
     write_csv(sobel_rows, out / "sobel_methods.csv")
     plot_sobel_methods(sobel_rows, out / "sobel_methods.png")
@@ -2763,6 +2954,7 @@ def main(argv=None):
              "sizes": args.sizes, "small_sizes": small, "trials": args.trials, "seed": args.seed,
              "random_shapes": random_shapes(names), "shape_ladders": shape_ladders(names),
              "cv_threads": cv_threads, "command": command, "quality_chart": quality_chart,
+             "fast_cores": fast_cores,
              "photo": display_path(photo_path) if photo is not None else None,
              "photo_bundled": args.photo is None,
              "photo_size": f"{photo.shape[1]} x {photo.shape[0]}" if photo is not None else None}

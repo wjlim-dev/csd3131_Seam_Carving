@@ -2,6 +2,7 @@
 
 import csv
 import re
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -505,7 +506,7 @@ def test_graph_cut_is_a_default_finder():
     assert run_bench.parse_args([]).algos == ["dp", "greedy", "graphcut"]
 
 
-# ---------- Item 2b: the Sobel filter four ways ----------
+# ---------- Item 2b: the Sobel filter five ways ----------
 
 @pytest.mark.parametrize("shape", [(2, 3), (7, 10), (65, 129), (130, 70)])
 def test_every_sobel_method_gives_opencvs_map(shape):
@@ -515,6 +516,15 @@ def test_every_sobel_method_gives_opencvs_map(shape):
         assert np.allclose(method(gray), reference, atol=1e-9), name
     # Tiny tiles force many splits along both sides.
     assert np.allclose(run_bench.sobel_divide_conquer(gray, leaf=4), reference, atol=1e-9)
+
+
+def test_reused_arrays_give_exactly_the_one_pass_result_and_are_reused():
+    gray = np.random.default_rng(2).random((33, 50)) * 255
+    first = run_bench.sobel_reused(gray)
+    assert np.array_equal(first, run_bench.sobel_direct(gray))  # same arithmetic, same order
+    assert run_bench.sobel_reused(gray) is first  # the second call writes into the same array
+    thin = np.random.default_rng(3).random((1, 6))  # no reflected border: falls back to one pass
+    assert np.array_equal(run_bench.sobel_reused(thin), run_bench.sobel_direct(thin))
 
 
 def test_opencv_method_is_exactly_energy_py():
@@ -704,7 +714,8 @@ def fake_run():
                              **timed("graphcut", gc * w ** 2), "graphcut_searches": searches * w,
                              "greedy_edge": edge})
     sobel_rows = [{"width": w, "height": h, "pixels": w * h, **timed("opencv", 0.001 * w),
-                   **timed("direct", 0.004 * w), **timed("divide", 0.006 * w), **timed("fft", 0.012 * w),
+                   **timed("direct", 0.004 * w), **timed("reused", 0.003 * w),
+                   **timed("divide", 0.006 * w), **timed("fft", 0.012 * w),
                    **{f"{m}_diff": 1e-13 for m in run_bench.SOBEL_METHODS}}
                   for w, h in ((20, 13), (80, 53))]
     tile_rows = [{"leaf": leaf, "label": label, "tiles": tiles, "width": 80, "height": 53,
@@ -737,7 +748,11 @@ def test_fake_run_summary_has_every_part_and_no_lowercase_sentence_starts():
                    "DP does the same steps whatever the values",
                    "The photo sits in between: 1200 searches",
                    "slower than these images would give",
-                   "one carve would take over"]:
+                   "one carve would take over",
+                   "Both slowed by a similar amount, so the cost is in reaching the memory itself",
+                   "outgrow a CPU core's own fast cache",
+                   "FFT convolution is itself divide and conquer",
+                   "for greedy, its scan along the whole top row"]:
         assert phrase in summary, phrase
     assert not re.search(r"(\. |\*\* |^- )(dp|greedy|graphcut) ", summary, re.MULTILINE)
 
@@ -747,13 +762,82 @@ def test_fake_run_wording_when_divide_and_conquer_wins_through_the_cache():
     run["sobel_rows"][-1]["divide_ms"] = run["sobel_rows"][-1]["direct_ms"] * 0.5  # only the largest
     summary = summary_of(run)
     assert "**Would divide and conquer speed up the Sobel filter? (Item 2b):** not by cutting the work" in summary
-    assert "ran 2.0x faster than the same filter in one pass at 80 x 53 but was slower at smaller sizes" in summary
-    assert "took 3.0x as long as with tiles of at most 32 x 32, so the gain comes from the CPU's cache" in summary
-    assert "It still ran faster at 80 x 53, though slower at 20 x 13. The tile-size check below shows why" in summary
-    assert "At the smaller sizes the whole image's arrays fit in the cache anyway" in summary
+    assert ("ran 2.0x faster than the same filter in one pass with new arrays at 80 x 53 but was "
+            "slower at smaller sizes") in summary
+    assert "took 3.0x as long as with tiles of at most 32 x 32, so the gain most likely comes from the CPU's cache" in summary
+    assert ("It still ran faster at 80 x 53, though slower at 20 x 13. The tile-size check below "
+            "shows a constant-factor gain that most likely comes from the CPU's cache") in summary
     assert "### Tile size" in summary
     assert "Smaller tiles were slower because every tile costs a Python call" in summary
     assert "Bigger tiles were slower too, up to 6.00 ms for one whole-image tile (3.0x the best)" in summary
+    assert "Big arrays also outgrow the CPU's fast cache" in summary
+
+
+def test_fake_run_wording_when_divide_and_conquer_wins_through_fresh_arrays():
+    run = fake_run()
+    large = run["sobel_rows"][-1]  # 80 x 53; the 20 x 13 row keeps one pass 0.08 ms, reused 0.06 ms
+    large.update(**timed("direct", 5.2), **timed("reused", 1.47), **timed("divide", 2.6))
+    summary = summary_of(run)
+    assert ("The same one pass writing into reused arrays took 1.47 ms, 3.5x faster than with new "
+            "arrays, so the gain comes from making smaller fresh arrays") in summary
+    assert "The one pass with reused arrays shows why: large new arrays are slow to make" in summary
+    assert "At the smaller sizes the one pass with new arrays was within 1.5x" in summary
+    assert ("the version with new arrays slowed 4.0x and the version with reused arrays 1.5x. The "
+            "arithmetic is the same, so most of the slowdown at large sizes is the cost of making "
+            "fresh arrays; the reused version's own 1.5x is most likely the CPU's cache") in summary
+    assert "The reused-array pass above shows that large new arrays are what is slow" in summary
+    assert "Section 6 shows what that costs: the same Sobel arithmetic slowed 4.0x per pixel" in summary
+
+
+def test_fake_run_wording_when_fresh_arrays_explain_it_without_the_cache():
+    run = fake_run()
+    large = run["sobel_rows"][-1]
+    large.update(**timed("direct", 5.2), **timed("reused", 0.5), **timed("divide", 2.6))
+    small = run["sobel_rows"][0]
+    small.update(**timed("reused", 0.04))  # one pass at 20 x 13 is 2x this: tiles were not cheap there
+    summary = summary_of(run)
+    assert "most of the slowdown at large sizes is the cost of making fresh arrays. Large arrays" in summary
+    assert "the reused version's own" not in summary
+    assert "At the smaller sizes the one pass with new arrays was within 1.5x" not in summary
+
+
+def test_prefer_fast_cores_asks_windows_and_does_nothing_elsewhere(monkeypatch):
+    accepted = run_bench.prefer_fast_cores()
+    assert isinstance(accepted, bool)
+    if sys.platform == "win32":
+        assert accepted  # Windows 10 and later accept the request for their own process
+    monkeypatch.setattr(run_bench.sys, "platform", "linux")
+    assert run_bench.prefer_fast_cores() is False
+
+
+@pytest.mark.parametrize("fast_cores, words", [
+    (True, "Windows accepted the request for this run."),
+    (False, "The request is only available on Windows, so here the system chose the cores."),
+])
+def test_fake_run_reports_the_core_request(fast_cores, words):
+    run = fake_run()
+    run["setup"]["fast_cores"] = fast_cores
+    summary = summary_of(run)
+    assert words in summary
+    assert ("Windows power throttling turned off for this process" in summary) == fast_cores
+
+
+@pytest.mark.parametrize("h_power, w_power, words", [
+    (1.0, 0.0, "grows with the height (slope 1.00) far more than with the width (slope 0.00)"),
+    (0.8, 0.6, "grows with the height (slope 0.80) more than with the width (slope 0.60)"),
+    (0.7, 0.7, "about as much as with the width (slope 0.70). Its work is O(H x W), and at these sizes both sides"),
+])
+def test_fake_run_words_dps_growth_from_its_slopes(h_power, w_power, words):
+    run = fake_run()
+    for row in run["shapes"]:
+        if row["ladder"] == "main":
+            row.update(**timed("dp", 1e-3 * row["height"] ** h_power * row["width"] ** w_power))
+    assert words in summary_of(run)
+
+
+def test_memory_comparison_needs_two_sizes():
+    one = [{"width": 8, "height": 5, "pixels": 40, "direct_ms": 1.0, "reused_ms": 0.5}]
+    assert run_bench._memory_effect(one) is None and run_bench._memory_sentence(one) == ""
 
 
 def test_fake_run_wording_when_tiles_show_no_cache_effect():
@@ -764,8 +848,9 @@ def test_fake_run_wording_when_tiles_show_no_cache_effect():
         row["divide_ms"] = 2.0  # tile size makes no difference
     summary = summary_of(run)
     assert "the cause of the gain is unclear" in summary
-    assert "does not show a clear cache effect, so the cause is unclear" in summary
-    assert "close to the best, so the cache makes little difference at this size" in summary
+    assert ("Neither the reused-array pass nor the tile-size check shows a clear memory effect, so "
+            "the cause is unclear") in summary
+    assert "close to the best, so memory makes little difference at this size" in summary
 
 
 def test_tile_effect_needs_small_tiles_to_compare_with():

@@ -36,7 +36,7 @@ Use `images/small.png` (50 x 40) for graph cut.
 | `seam_carving/graphcut.py` | P5 | graph cut seam finder (min-cut / max-flow, small images only) |
 | `seam_carving/visualize.py` | P6 | seam overlay, all-seams image, step-by-step GIF |
 | `app.py` | P6 | interactive Streamlit app (resize, step-by-step view, compare) |
-| `benchmarks/run_bench.py` | P3 | timing and comparison (to add) |
+| `benchmarks/run_bench.py` | P3 | timing and comparison of the finders |
 | `cli.py` | P1 | command-line entry point |
 | `tests/` | everyone | `test_<your part>.py` |
 
@@ -64,6 +64,32 @@ callback(step, direction, current_img, seam_mask, orig_rows, orig_cols)
 # seam_mask:   bool array, same height/width as current_img, True on the seam
 # orig_rows, orig_cols: where the removed pixels were in the ORIGINAL image
 ```
+
+## Benchmarks (P3)
+
+`benchmarks/run_bench.py` times and compares every finished finder on the same inputs.
+Its results are the source of report Sections 3.3 and 8.
+
+```bash
+python benchmarks/run_bench.py                    # dp, greedy and graphcut, about 5 minutes
+python benchmarks/run_bench.py --algos dp greedy  # leave out graph cut
+```
+
+It runs six experiments, after a few checks on the timing method itself:
+
+1. Time and memory to find one seam as the image grows (Item 5b).
+2. Height against width, and the same sizes on different energy maps (Items 4, 5b).
+3. Seam cost against DP's on the same energy map, for images and random maps (Items 3, 4, 5c).
+4. Full carves of the drawing and a photo, against scaling and the best crop (Items 3, 4, 5c).
+5. OpenCV on 1 thread against its default number of threads (Item 5d).
+6. The Sobel filter five ways: OpenCV, one NumPy pass with new or reused arrays, divide and conquer, FFT (Item 2b).
+
+- Results go to `out/bench/` (git-ignored): `summary.md` has every table and conclusion, plus CSVs, charts and seam pictures.
+- Graph cut only runs on inputs up to 3,600 pixels (60 x 60, the same limit as the app), so every finder also runs on small copies of the inputs and graph cut is always compared on the same ones.
+- Each timing is the median of 3 passes that take turns over the inputs. A timing whose slowest pass is over 1.5x its fastest is flagged in `summary.md` and left out of the growth fits, so close heavy programs (games, video) while it runs.
+- On Windows the script asks not to be throttled, which keeps it on the fast cores of CPUs that also have efficient ones.
+- The second test image is matplotlib's sample photo `grace_hopper.jpg`; `--photo none` leaves it out. `--help` lists the other options (`--image`, `--sizes`, `--width`, `--height`, `--repeats`, `--trials`, `--seed`, `--output`).
+- `tests/test_bench.py` checks the benchmark itself and runs every line of it.
 
 ## Graph cut (P5)
 
