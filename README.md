@@ -16,6 +16,7 @@ pip install -r requirements.txt
 ```bash
 python cli.py images/sample.png --width 180 --height 130 --algo dp --output out/dp.png
 pytest
+streamlit run app.py   # interactive app, opens http://localhost:8501
 ```
 
 `--algo` is one of `dummy`, `dp`, `greedy`, `graphcut`. `dummy` is a placeholder
