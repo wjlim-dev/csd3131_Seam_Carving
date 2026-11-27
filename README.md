@@ -4,6 +4,8 @@ A Python program that shrinks an image to a smaller width and height by removing
 
 ![Screenshot](docs/screenshot.png)
 
+**Live demo:** https://csd3131seamcarving-ca7zxfcacxrvwbhmbstyrb.streamlit.app/
+
 ## What it does
 
 - Resizes any PNG or JPG to a smaller size, from a browser app or the command line.
